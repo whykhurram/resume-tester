@@ -24,7 +24,7 @@ from pypdf import PdfReader
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
-MODEL_CHOICES = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+MODEL_CHOICES = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.5-flash-lite"]
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", MODEL_CHOICES[0])
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 20_000  # keeps the prompt small & cheap
@@ -236,6 +236,27 @@ def analyze_resume(
     return report
 
 
+def is_model_not_found(exc: Exception) -> bool:
+    low = str(exc).lower()
+    return "404" in low or "not_found" in low or "not found" in low
+
+
+def analyze_with_fallback(
+    api_key: str, model: str, resume_text: str, job_description: str, allow_fallback: bool
+):
+    """Try the chosen model; if it doesn't exist for this key, try the other known ones."""
+    candidates = [model] + ([m for m in MODEL_CHOICES if m != model] if allow_fallback else [])
+    last_exc: Optional[Exception] = None
+    for name in candidates:
+        try:
+            return analyze_resume(api_key, name, resume_text, job_description), name
+        except Exception as exc:
+            last_exc = exc
+            if not is_model_not_found(exc):
+                raise
+    raise last_exc  # type: ignore[misc]
+
+
 def friendly_error(exc: Exception) -> str:
     msg = str(exc)
     low = msg.lower()
@@ -353,7 +374,8 @@ def main() -> None:
         )
         model = st.selectbox("Model", MODEL_CHOICES, index=MODEL_CHOICES.index(DEFAULT_MODEL) if DEFAULT_MODEL in MODEL_CHOICES else 0)
         custom_model = st.text_input("Custom model name (optional)", placeholder="e.g. gemini-2.5-flash")
-        if custom_model.strip():
+        use_custom = bool(custom_model.strip())
+        if use_custom:
             model = custom_model.strip()
         st.info("🔒 Your resume is sent to the Gemini API for analysis and is not stored by this app.")
 
@@ -395,7 +417,11 @@ def main() -> None:
 
         with st.spinner("Analyzing your resume with Gemini..."):
             try:
-                report = analyze_resume(api_key, model, text, job_description)
+                report, used_model = analyze_with_fallback(
+                    api_key, model, text, job_description, allow_fallback=not use_custom
+                )
+                if used_model != model:
+                    st.info(f"'{model}' wasn't available, so '{used_model}' was used instead.")
             except Exception as exc:
                 st.error(friendly_error(exc))
                 st.stop()
