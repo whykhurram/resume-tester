@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+import time
 from typing import List, Literal, Optional
 
 import streamlit as st
@@ -241,18 +242,35 @@ def is_model_not_found(exc: Exception) -> bool:
     return "404" in low or "not_found" in low or "not found" in low
 
 
+def is_overloaded(exc: Exception) -> bool:
+    low = str(exc).lower()
+    return "503" in low or "unavailable" in low or "overloaded" in low or "high demand" in low
+
+
+RETRIES_PER_MODEL = 2  # extra attempts on a busy model before switching
+RETRY_DELAY_SECONDS = 2.0
+
+
 def analyze_with_fallback(
     api_key: str, model: str, resume_text: str, job_description: str, allow_fallback: bool
 ):
-    """Try the chosen model; if it doesn't exist for this key, try the other known ones."""
+    """Try the chosen model. Retry briefly if Google reports high demand (503),
+    and move to the next known model if this one is busy or doesn't exist."""
     candidates = [model] + ([m for m in MODEL_CHOICES if m != model] if allow_fallback else [])
     last_exc: Optional[Exception] = None
     for name in candidates:
-        try:
-            return analyze_resume(api_key, name, resume_text, job_description), name
-        except Exception as exc:
-            last_exc = exc
-            if not is_model_not_found(exc):
+        for attempt in range(RETRIES_PER_MODEL + 1):
+            try:
+                return analyze_resume(api_key, name, resume_text, job_description), name
+            except Exception as exc:
+                last_exc = exc
+                if is_overloaded(exc):
+                    if attempt < RETRIES_PER_MODEL:
+                        time.sleep(RETRY_DELAY_SECONDS * (attempt + 1))
+                        continue
+                    break  # still busy -> next model
+                if is_model_not_found(exc):
+                    break  # next model
                 raise
     raise last_exc  # type: ignore[misc]
 
@@ -264,6 +282,8 @@ def friendly_error(exc: Exception) -> str:
         return "The Gemini API key looks invalid or lacks permission. Check the key and try again."
     if "429" in low or "quota" in low or "resource_exhausted" in low:
         return "Rate limit or quota reached on the Gemini API. Wait a minute and try again."
+    if is_overloaded(exc):
+        return "Google's Gemini servers are busy right now (503). Please wait a minute and click Analyze again."
     if "404" in low or "not found" in low:
         return "That model name was not found. Pick another model in the sidebar."
     if isinstance(exc, (json.JSONDecodeError, ValueError)):
@@ -421,7 +441,7 @@ def main() -> None:
                     api_key, model, text, job_description, allow_fallback=not use_custom
                 )
                 if used_model != model:
-                    st.info(f"'{model}' wasn't available, so '{used_model}' was used instead.")
+                    st.info(f"'{model}' wasn't available or was busy, so '{used_model}' was used instead.")
             except Exception as exc:
                 st.error(friendly_error(exc))
                 st.stop()
